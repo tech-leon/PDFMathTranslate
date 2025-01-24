@@ -8,7 +8,8 @@ import tempfile
 import urllib.request
 from asyncio import CancelledError
 from pathlib import Path
-from typing import Any, BinaryIO, List, Optional
+from string import Template
+from typing import Any, BinaryIO, List, Optional, Dict
 
 import numpy as np
 import requests
@@ -21,20 +22,12 @@ from pdfminer.pdfparser import PDFParser
 from pymupdf import Document, Font
 
 from pdf2zh.converter import TranslateConverter
-from pdf2zh.doclayout import DocLayoutModel
+from pdf2zh.doclayout import OnnxModel
 from pdf2zh.pdfinterp import PDFPageInterpreterEx
 
-model = DocLayoutModel.load_available()
+from pdf2zh.config import ConfigManager
 
-resfont_map = {
-    "zh-cn": "china-ss",
-    "zh-tw": "china-ts",
-    "zh-hans": "china-ss",
-    "zh-hant": "china-ts",
-    "zh": "china-ss",
-    "ja": "japan-s",
-    "ko": "korea-s",
-}
+NOTO_NAME = "noto"
 
 noto_list = [
     "am",  # Amharic
@@ -46,18 +39,14 @@ noto_list = [
     "gu",  # Gujarati
     "iw",  # Hebrew
     "hi",  # Hindi
-    # "ja",  # Japanese
     "kn",  # Kannada
-    # "ko",  # Korean
     "ml",  # Malayalam
     "mr",  # Marathi
     "ru",  # Russian
     "sr",  # Serbian
-    # "zh-cn",# SC
     "ta",  # Tamil
     "te",  # Telugu
     "th",  # Thai
-    # "zh-tw",# TC
     "ur",  # Urdu
     "uk",  # Ukrainian
 ]
@@ -84,10 +73,13 @@ def translate_patch(
     lang_in: str = "",
     lang_out: str = "",
     service: str = "",
-    resfont: str = "",
+    noto_name: str = "",
     noto: Font = None,
     callback: object = None,
     cancellation_event: asyncio.Event = None,
+    model: OnnxModel = None,
+    envs: Dict = None,
+    prompt: Template = None,
     **kwarg: Any,
 ) -> None:
     rsrcmgr = PDFResourceManager()
@@ -101,10 +93,10 @@ def translate_patch(
         lang_in,
         lang_out,
         service,
-        resfont,
+        noto_name,
         noto,
-        kwarg.get("envs", {}),
-        kwarg.get("prompt", []),
+        envs,
+        prompt,
     )
 
     assert device is not None
@@ -179,38 +171,24 @@ def translate_stream(
     vchar: str = "",
     callback: object = None,
     cancellation_event: asyncio.Event = None,
+    model: OnnxModel = None,
+    envs: Dict = None,
+    prompt: Template = None,
     **kwarg: Any,
 ):
     font_list = [("tiro", None)]
-    noto = None
-    if lang_out.lower() in resfont_map:  # CJK
-        resfont = resfont_map[lang_out.lower()]
-        font_list.append((resfont, None))
-    elif lang_out.lower() in noto_list:  # noto
-        resfont = "noto"
-        # docker
-        ttf_path = os.environ.get("NOTO_FONT_PATH", "/app/GoNotoKurrent-Regular.ttf")
 
-        if not os.path.exists(ttf_path):
-            ttf_path = os.path.join(tempfile.gettempdir(), "GoNotoKurrent-Regular.ttf")
-        if not os.path.exists(ttf_path):
-            print("Downloading Noto font...")
-            urllib.request.urlretrieve(
-                "https://github.com/satbyy/go-noto-universal/releases/download/v7.0/GoNotoKurrent-Regular.ttf",
-                ttf_path,
-            )
-        font_list.append(("noto", ttf_path))
-        noto = Font("noto", ttf_path)
-    else:  # fallback
-        resfont = "china-ss"
-        font_list.append(("china-ss", None))
+    font_path = download_remote_fonts(lang_out.lower())
+    noto_name = NOTO_NAME
+    noto = Font(noto_name, font_path)
+    font_list.append((noto_name, font_path))
 
     doc_en = Document(stream=stream)
     stream = io.BytesIO()
     doc_en.save(stream)
     doc_zh = Document(stream=stream)
     page_count = doc_zh.page_count
-    # font_list = [("china-ss", None), ("tiro", None)]
+    # font_list = [("GoNotoKurrent-Regular.ttf", font_path), ("tiro", None)]
     font_id = {}
     for page in doc_zh:
         for font in font_list:
@@ -233,8 +211,9 @@ def translate_stream(
                 pass
 
     fp = io.BytesIO()
+
     doc_zh.save(fp)
-    obj_patch: dict = translate_patch(fp, prompt=kwarg["prompt"], **locals())
+    obj_patch: dict = translate_patch(fp, **locals())
 
     for obj_id, ops_new in obj_patch.items():
         # ops_old=doc_en.xref_stream(obj_id)
@@ -247,7 +226,12 @@ def translate_stream(
     for id in range(page_count):
         doc_en.move_page(page_count + id, id * 2 + 1)
 
-    return doc_zh.write(deflate=1), doc_en.write(deflate=1)
+    doc_zh.subset_fonts(fallback=True)
+    doc_en.subset_fonts(fallback=True)
+    return (
+        doc_zh.write(deflate=True, garbage=3, use_objstms=1),
+        doc_en.write(deflate=True, garbage=3, use_objstms=1),
+    )
 
 
 def convert_to_pdfa(input_path, output_path):
@@ -312,6 +296,9 @@ def translate(
     callback: object = None,
     compatible: bool = False,
     cancellation_event: asyncio.Event = None,
+    model: OnnxModel = None,
+    envs: Dict = None,
+    prompt: Template = None,
     **kwarg: Any,
 ):
     if not files:
@@ -328,7 +315,9 @@ def translate(
     result_files = []
 
     for file in files:
-        if file is str and (file.startswith("http://") or file.startswith("https://")):
+        if type(file) is str and (
+            file.startswith("http://") or file.startswith("https://")
+        ):
             print("Online files detected, downloading...")
             try:
                 r = requests.get(file, allow_redirects=True)
@@ -364,11 +353,8 @@ def translate(
 
         if file.startswith(tempfile.gettempdir()):
             os.unlink(file)
-
         s_mono, s_dual = translate_stream(
             s_raw,
-            envs=kwarg.get("envs", {}),
-            prompt=kwarg.get("prompt", []),
             **locals(),
         )
         file_mono = Path(output) / f"{filename}-mono.pdf"
@@ -382,3 +368,31 @@ def translate(
         result_files.append((str(file_mono), str(file_dual)))
 
     return result_files
+
+
+def download_remote_fonts(lang: str):
+    URL_PREFIX = "https://github.com/timelic/source-han-serif/releases/download/main/"
+    LANG_NAME_MAP = {
+        **{la: "GoNotoKurrent-Regular.ttf" for la in noto_list},
+        **{
+            la: f"SourceHanSerif{region}-Regular.ttf"
+            for region, langs in {
+                "CN": ["zh-cn", "zh-hans", "zh"],
+                "TW": ["zh-tw", "zh-hant"],
+                "JP": ["ja"],
+                "KR": ["ko"],
+            }.items()
+            for la in langs
+        },
+    }
+    font_name = LANG_NAME_MAP.get(lang, "GoNotoKurrent-Regular.ttf")
+
+    # docker
+    font_path = ConfigManager.get("NOTO_FONT_PATH", Path("/app", font_name).as_posix())
+    if not Path(font_path).exists():
+        font_path = Path(tempfile.gettempdir(), font_name).as_posix()
+    if not Path(font_path).exists():
+        print(f"Downloading {font_name}...")
+        urllib.request.urlretrieve(f"{URL_PREFIX}{font_name}", font_path)
+
+    return font_path
